@@ -1,10 +1,14 @@
 import java.text.SimpleDateFormat
-
 import org.apache.flink.streaming.api.TimeCharacteristic
 import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironment}
 import org.apache.flink.api.scala._
 import org.apache.flink.configuration.Configuration
-import util.Protocol.{Commit, CommitGeo, CommitSummary}
+import org.apache.flink.streaming.api.functions.co.ProcessJoinFunction
+import org.apache.flink.streaming.api.functions.timestamps.BoundedOutOfOrdernessTimestampExtractor
+import org.apache.flink.streaming.api.windowing.assigners.{SlidingEventTimeWindows, TumblingEventTimeWindows}
+import org.apache.flink.streaming.api.windowing.time.Time
+import org.apache.flink.util.Collector
+import util.Protocol.{Commit, CommitGeo, CommitSummary, Stats}
 import util.{CommitGeoParser, CommitParser}
 
 /** Do NOT rename this class, otherwise autograding will fail. **/
@@ -35,15 +39,15 @@ object FlinkAssignment {
         .map(new CommitGeoParser)
 
     /** Use the space below to print and test your questions. */
-    dummy_question(commitStream).print()
+    dummy_question(commitStream, commitGeoStream).print()
 
     /** Start the streaming environment. **/
     env.execute()
   }
 
   /** Dummy question which maps each commits to its SHA. */
-  def dummy_question(input: DataStream[Commit]): DataStream[String] = {
-    input.map(_.sha)
+  def dummy_question(input: DataStream[Commit], geo: DataStream[CommitGeo]): DataStream[(String, Int)] = {
+    question_eight(input, geo)
   }
 
   /**
@@ -56,13 +60,22 @@ object FlinkAssignment {
     * Write a Flink application which outputs the names of the files with more than 30 deletions.
     * Output format:  fileName
     */
-  def question_two(input: DataStream[Commit]): DataStream[String] = ???
+  def question_two(input: DataStream[Commit]): DataStream[String] = input
+    .flatMap(x => x.files)
+    .filter(x => x.deletions > 30)
+    .map(x => x.filename.getOrElse("unknown"))
 
   /**
     * Count the occurrences of Java and Scala files. I.e. files ending with either .scala or .java.
     * Output format: (fileExtension, #occurrences)
     */
-  def question_three(input: DataStream[Commit]): DataStream[(String, Int)] = ???
+  def question_three(input: DataStream[Commit]): DataStream[(String, Int)] = input
+    .flatMap(x => x.files)
+    .map(x => x.filename.getOrElse("unknown").split("\\.").last)
+    .filter(x => x == "java" || x == "scala")
+    .map(x => (x, 1))
+    .keyBy(_._1)
+    .sum(1)
 
   /**
     * Count the total amount of changes for each file status (e.g. modified, removed or added) for the following extensions: .js and .py.
@@ -83,7 +96,20 @@ object FlinkAssignment {
     * Compute every 12 hours the amount of small and large commits in the last 48 hours.
     * Output format: (type, count)
     */
-  def question_six(input: DataStream[Commit]): DataStream[(String, Int)] = ???
+  def question_six(input: DataStream[Commit]): DataStream[(String, Int)] = input
+    .assignTimestampsAndWatermarks(
+      new BoundedOutOfOrdernessTimestampExtractor[Commit](Time.hours(12))
+      {
+        override def extractTimestamp(element: Commit): Long = {
+          element.commit.committer.date.getTime
+        }
+      }
+    )
+    .map(x => if (x.stats.getOrElse(Stats(0, 0, 0)).total <= 20) "small"  else "large")
+    .map(x => (x, 1))
+    .keyBy(x => x._1)
+    .window(SlidingEventTimeWindows.of(Time.hours(48), Time.hours(12)))
+    .sum(1)
 
   /**
     * For each repository compute a daily commit summary and output the summaries with more than 20 commits and at most 2 unique committers. The CommitSummary case class is already defined.
@@ -113,7 +139,43 @@ object FlinkAssignment {
     */
   def question_eight(
       commitStream: DataStream[Commit],
-      geoStream: DataStream[CommitGeo]): DataStream[(String, Int)] = ???
+      geoStream: DataStream[CommitGeo]): DataStream[(String, Int)] = commitStream
+    .assignTimestampsAndWatermarks(
+      new BoundedOutOfOrdernessTimestampExtractor[Commit](Time.hours(12))
+      {
+        override def extractTimestamp(element: Commit): Long = {
+          element.commit.committer.date.getTime
+        }
+      }
+    )
+    .keyBy(x => x.sha)
+    .intervalJoin(geoStream
+      .assignTimestampsAndWatermarks(
+        new BoundedOutOfOrdernessTimestampExtractor[CommitGeo](Time.hours(12))
+        {
+          override def extractTimestamp(element: CommitGeo): Long = {
+            element.createdAt.getTime
+          }
+        }
+      )
+      .keyBy(x => x.sha))
+    .between(Time.hours(-1), Time.minutes(30))
+    .process(new ProcessJoinFunction[Commit, CommitGeo, (Commit, CommitGeo)] {
+      override def processElement(
+                                   commit: Commit,
+                                   commitGeo: CommitGeo,
+                                   ctx: ProcessJoinFunction[Commit, CommitGeo, (Commit, CommitGeo)]#Context,
+                                   out: Collector[(Commit, CommitGeo)]): Unit = {
+        out.collect((commit, commitGeo))
+      }
+    })
+    .map(x => (x._2.continent, x._1.files
+      .filter(x => x.filename.getOrElse("unknown").split("\\.").last == "java")
+      .map(x => x.changes).sum))
+    .keyBy(x => x._1)
+    .window(TumblingEventTimeWindows.of(Time.days(7)))
+    .sum(1)
+    .filter(x => x._2 != 0)
 
   /**
     * Find all files that were added and removed within one day. Output as (repository, filename).
