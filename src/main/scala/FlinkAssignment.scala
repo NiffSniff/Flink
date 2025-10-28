@@ -47,7 +47,7 @@ object FlinkAssignment {
         .map(new CommitGeoParser)
 
     /** Use the space below to print and test your questions. */
-    dummy_question(commitStream, commitGeoStream).print()
+    dummy_question(commitStream).print()
 
     /** Start the streaming environment. **/
     env.execute()
@@ -120,7 +120,7 @@ object FlinkAssignment {
   def question_five(input: DataStream[Commit]): DataStream[(String, Int)] = {
     input
       .assignTimestampsAndWatermarks(
-        new BoundedOutOfOrdernessTimestampExtractor[Commit](Time.days(1)) // WTF IS THIS LECTURERS
+        new BoundedOutOfOrdernessTimestampExtractor[Commit](Time.days(1))
         {
           override def extractTimestamp(element: Commit): Long = {
             element.commit.committer.date.getTime
@@ -279,19 +279,27 @@ object FlinkAssignment {
       }
     }
 
-    // Define the CEP pattern: added followed by removed within 1 day
+    val timestampedFileEvents = fileEvents.assignTimestampsAndWatermarks(
+      new BoundedOutOfOrdernessTimestampExtractor[(String, String, String, Long)](Time.minutes(1))
+      {
+        override def extractTimestamp(element: (String, String, String, Long)): Long = {
+          element._4
+        }
+      }
+    )
+
     val pattern = Pattern.begin[(String, String, String, Long)]("added")
       .where(_._3 == "added")
       .followedBy("removed")
       .where(_._3 == "removed")
       .within(Time.days(1))
 
-    val patternStream = CEP.pattern(fileEvents.keyBy(_._2), pattern)
+    val patternStream = CEP.pattern(timestampedFileEvents.keyBy(x => (x._1, x._2)), pattern)
 
     patternStream.select(new PatternSelectFunction[(String, String, String, Long), (String, String)] {
       override def select(pattern: java.util.Map[String, java.util.List[(String, String, String, Long)]]) = {
         val addedEvent = pattern.get("added").get(0)
-        (addedEvent._1, addedEvent._2) // (repository, filename)
+        (addedEvent._1, addedEvent._2)
       }
     })
   }
